@@ -1,0 +1,11 @@
+{
+  "tunnel_addr": "0.0.0.0:22336",
+  "socks_addr": "0.0.0.0:22337",
+  "socks_user": "admin",
+  "socks_pass": "admin@123",
+  "token": "2e0a419a-213e-41f7-b553-ec21425c6d66",
+  "auth_drift_tolerance": "60s",
+  "heartbeat_interval": "10s",
+  "heartbeat_timeout": "30s",
+  "max_agents": 10
+}
