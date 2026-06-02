@@ -2,7 +2,7 @@
 
 基于 Go 语言实现的反向代理隧道工具，用于穿透 NAT/防火墙，从公网访问内网服务
 
-完全使用[MiMo-v2.5-pro](http://mimo.xiaomi.com/zh/mi)实现，`0% 人工代码`，`100 %AI 生成`
+完全使用[MiMo-v2.5-pro](http://mimo.xiaomi.com/zh/mi)实现，`0% 人工代码`，`100% AI 生成`
 
 功能实现近似于[FRP](https://github.com/fatedier/frp)的以下配置
 
