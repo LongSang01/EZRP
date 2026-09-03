@@ -45,25 +45,39 @@ func NewTunnelConn(connID uint64) *TunnelConn {
 		ConnID:  connID,
 		ctx:     ctx,
 		cancel:  cancel,
-		readCh:  make(chan []byte, 256),
+		readCh:  make(chan []byte, 4096),
 		closeCh: make(chan struct{}),
 	}
 }
 
 // SendData 向此隧道连接发送数据（写入 readCh 缓冲区）
-// 返回 false 表示缓冲区已满或连接已关闭
-func (tc *TunnelConn) SendData(data []byte) bool {
+// 使用完全阻塞写入实现背压：当消费端读取慢时，发送端会阻塞等待，
+// 由异步 goroutine 承载等待开销，绝不会丢弃数据。
+// 返回 false 表示连接已关闭或上下文取消。
+func (tc *TunnelConn) SendData(ctx context.Context, data []byte) bool {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	if tc.closed.Load() {
 		return false
 	}
+
+	// 首先尝试非阻塞发送（正常路径，缓冲区有空间时零开销）
 	select {
 	case tc.readCh <- data:
 		return true
 	default:
-		//缓冲区已满
-		return false // buffer full
+	}
+
+	// 缓冲区满——完全阻塞等待空间释放，绝不丢数据
+	// 异步 goroutine 会承载此阻塞，不影响 agentReadLoop 处理其他连接
+	// 连接关闭时通过 closeCh 解除阻塞
+	select {
+	case tc.readCh <- data:
+		return true
+	case <-tc.closeCh:
+		return false
+	case <-ctx.Done():
+		return false
 	}
 }
 

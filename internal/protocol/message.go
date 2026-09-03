@@ -78,6 +78,13 @@ type Codec struct {
 	sendSeq uint64 // 出帧计数器（单调递增）
 	recvSeq uint64 // 入帧计数器（单调递增）
 	side    uint8  // crypto.SideClient 或 crypto.SideServer
+
+	// 写缓冲区复用：writeFrame 不再每次 make，而是复用此切片
+	// 减少高频数据转发路径上的内存分配和 GC 压力
+	writeBuf []byte
+
+	// 读头部缓冲区复用：ReadMessage 每帧复用14字节头部缓冲区
+	readHeader []byte
 }
 
 // NewCodec 创建新的协议编解码器
@@ -114,7 +121,20 @@ func (c *Codec) writeFrame(msgType uint8, connID uint64, payload []byte) error {
 	}
 
 	// 报文头（始终为明文）: Type(1) + ConnID(8) + Side(1) + Length(4)
-	buf := make([]byte, HeaderSize+len(payload))
+	// 复用 c.writeBuf 避免每次分配，仅在容量不足时扩容
+	need := HeaderSize + len(payload)
+	if cap(c.writeBuf) >= need {
+		c.writeBuf = c.writeBuf[:need]
+	} else {
+		// 容量不足：按2倍扩容以减少后续扩容次数（参考 frp 的缓冲策略）
+		newCap := cap(c.writeBuf) * 2
+		if newCap < need {
+			newCap = need
+		}
+		c.writeBuf = make([]byte, need, newCap)
+	}
+
+	buf := c.writeBuf
 	buf[0] = msgType
 	binary.BigEndian.PutUint64(buf[1:9], connID)
 	buf[9] = c.side
@@ -142,16 +162,24 @@ func (c *Codec) ReadMessage() (*Message, error) {
 	c.decMu.Lock()
 	defer c.decMu.Unlock()
 
-	header := make([]byte, HeaderSize)
+	// 复用 header 缓冲区，避免每帧分配14字节
+	if cap(c.readHeader) >= HeaderSize {
+		c.readHeader = c.readHeader[:HeaderSize]
+	} else {
+		c.readHeader = make([]byte, HeaderSize)
+	}
+	header := c.readHeader
+
 	if _, err := io.ReadFull(c.rw, header); err != nil {
 		return nil, err
 	}
 
-	msg := &Message{
-		Type:   header[0],
-		ConnID: binary.BigEndian.Uint64(header[1:9]),
-		Length: binary.BigEndian.Uint32(header[10:14]),
-	}
+	// 从池中获取 Message struct，减少 GC 压力
+	msg := msgPool.Get().(*Message)
+	msg.Type = header[0]
+	msg.ConnID = binary.BigEndian.Uint64(header[1:9])
+	msg.Length = binary.BigEndian.Uint32(header[10:14])
+	msg.Payload = nil // 重置 Payload，后续由 make 分配新切片
 
 	// 从头部字节 [9] 提取发送方标识（用于还原正确的解密 nonce）
 	msgSide := header[9]
@@ -159,7 +187,7 @@ func (c *Codec) ReadMessage() (*Message, error) {
 	var seq uint64
 
 	if msg.Length > 0 {
-		if msg.Length > 10*1024*1024 { // 最大报文体 10MB
+		if msg.Length > 16*1024*1024 { // 最大报文体 16MB（参考 frp 大窗口设计）
 			return nil, fmt.Errorf("message too large: %d bytes", msg.Length)
 		}
 		msg.Payload = make([]byte, msg.Length)
@@ -184,6 +212,19 @@ func (c *Codec) ReadMessage() (*Message, error) {
 	// 更新 Length 为实际载荷长度（供调用方检查）
 	msg.Length = uint32(len(msg.Payload))
 	return msg, nil
+}
+
+// msgPool 池化 Message struct，减少高频读取路径上的内存分配
+var msgPool = sync.Pool{
+	New: func() interface{} {
+		return &Message{}
+	},
+}
+
+// Release 将 Message 归还到对象池，调用方应确保不再使用此 Message 及其 Payload
+func (m *Message) Release() {
+	m.Payload = nil // 防止池中对象持有大切片引用
+	msgPool.Put(m)
 }
 
 // AuthPayload 用于 TypeAuth 报文的认证载荷

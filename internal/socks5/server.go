@@ -296,7 +296,7 @@ func (s *Server) relay(left, right net.Conn, leftAddr, rightAddr string) {
 	cp := func(dst, src net.Conn) {
 		defer wg.Done()
 		defer cancel()
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, 64*1024) // 64KB 缓冲区，与 CopyData 保持一致
 		for {
 			select {
 			case <-ctx.Done():

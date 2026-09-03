@@ -190,10 +190,12 @@ func (s *Server) handleAgent(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr().String()
 	log.Infof("[Tunnel] New connection from %s", remoteAddr)
 
-	// 设置 TCP keepalive
+	// 设置 TCP keepalive 和内核缓冲区（参考 frp KCP 4MB buffer 策略）
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetReadBuffer(4 * 1024 * 1024)  // 4MB 接收缓冲区
+		tc.SetWriteBuffer(4 * 1024 * 1024) // 4MB 发送缓冲区
 	}
 
 	codec := protocol.NewCodec(conn)
@@ -278,34 +280,47 @@ func (s *Server) agentReadLoop(agent *Agent) {
 
 		switch msg.Type {
 		case protocol.TypeHeartbeat:
-			agent.codec.WriteMessage(&protocol.Message{Type: protocol.TypeHeartbeat})
+			// 心跳响应异步发送，避免写阻塞卡住整个读循环
+			go agent.codec.WriteMessage(&protocol.Message{Type: protocol.TypeHeartbeat})
+			msg.Release()
 
 		case protocol.TypeConnectOK:
 			tc, ok := agent.pool.Get(msg.ConnID)
 			if ok {
 				// 发送空载荷表示 CONNECT_OK 信号
-				tc.SendData(msg.Payload)
+				tc.SendData(s.ctx, msg.Payload)
 			}
+			msg.Release()
 
 		case protocol.TypeConnectFail:
 			tc, ok := agent.pool.Get(msg.ConnID)
 			if ok {
 				tc.Close()
 			}
+			msg.Release()
 
 		case protocol.TypeData:
-			tc, ok := agent.pool.Get(msg.ConnID)
+			// 异步分发：避免单个连接的 SendData 阻塞整个 agent 的消息循环
+			// 每个连接的数据处理在独立 goroutine 中进行
+			connID := msg.ConnID
+			payload := msg.Payload
+			msg.Release() // Message struct 归还池，payload 由 SendData 消费
+			tc, ok := agent.pool.Get(connID)
 			if ok {
-				if !tc.SendData(msg.Payload) {
-					log.Warnf("[Tunnel] Agent %d conn %d buffer full, dropping data", agent.ID, msg.ConnID)
-				}
+				go func() {
+					if !tc.SendData(s.ctx, payload) {
+						log.Warnf("[Tunnel] Agent %d conn %d SendData failed, consumer may be slow", agent.ID, connID)
+					}
+				}()
 			}
 
 		case protocol.TypeClose:
 			agent.pool.Remove(msg.ConnID)
+			msg.Release()
 
 		default:
 			log.Warnf("[Tunnel] Agent %d: unknown message type 0x%02x", agent.ID, msg.Type)
+			msg.Release()
 		}
 	}
 }

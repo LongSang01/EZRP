@@ -130,6 +130,8 @@ func (c *Client) connect() error {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetReadBuffer(4 * 1024 * 1024)  // 4MB 接收缓冲区
+		tc.SetWriteBuffer(4 * 1024 * 1024) // 4MB 发送缓冲区
 	}
 
 	c.mu.Lock()
@@ -229,21 +231,33 @@ func (c *Client) eventLoop() error {
 			if err := codec.WriteMessage(reply); err != nil {
 				return fmt.Errorf("send heartbeat: %w", err)
 			}
+			msg.Release()
 
 		case protocol.TypeConnect:
+			// handleConnect 在 goroutine 中运行，由其负责 Release
 			go c.handleConnect(msg)
 
 		case protocol.TypeData:
-			tc, ok := c.pool.Get(msg.ConnID)
+			// 异步分发：避免单个连接的 SendData 阻塞整个客户端的消息循环
+			connID := msg.ConnID
+			payload := msg.Payload
+			msg.Release()
+			tc, ok := c.pool.Get(connID)
 			if ok {
-				tc.SendData(msg.Payload)
+				go func() {
+					if !tc.SendData(c.ctx, payload) {
+						log.Warnf("[Client] conn %d SendData failed, consumer may be slow", connID)
+					}
+				}()
 			}
 
 		case protocol.TypeClose:
 			c.pool.Remove(msg.ConnID)
+			msg.Release()
 
 		default:
 			log.Warnf("[Client] Unknown message type: 0x%02x", msg.Type)
+			msg.Release()
 		}
 	}
 }
@@ -253,10 +267,14 @@ func (c *Client) handleConnect(msg *protocol.Message) {
 	if err := json.Unmarshal(msg.Payload, &cp); err != nil {
 		log.Errorf("[Client] Parse CONNECT payload: %v", err)
 		c.sendConnectFail(msg.ConnID, err.Error())
+		msg.Release()
 		return
 	}
 
-	log.Infof("[Client] CONNECT request: connID=%d target=%s", msg.ConnID, cp.Target)
+	connID := msg.ConnID
+	msg.Release() // Payload 已 Unmarshal，Message 可归还池
+
+	log.Infof("[Client] CONNECT request: connID=%d target=%s", connID, cp.Target)
 
 	// 拨号本地网络目标
 	dialer := &net.Dialer{
@@ -266,44 +284,46 @@ func (c *Client) handleConnect(msg *protocol.Message) {
 	conn, err := dialer.DialContext(c.ctx, "tcp", cp.Target)
 	if err != nil {
 		log.Errorf("[Client] Failed to connect to %s: %v", cp.Target, err)
-		c.sendConnectFail(msg.ConnID, err.Error())
+		c.sendConnectFail(connID, err.Error())
 		return
 	}
 
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetReadBuffer(4 * 1024 * 1024)  // 4MB 接收缓冲区
+		tc.SetWriteBuffer(4 * 1024 * 1024) // 4MB 发送缓冲区
 	}
 
 	// 发送 CONNECT_OK
-	if err := c.sendConnectOK(msg.ConnID); err != nil {
+	if err := c.sendConnectOK(connID); err != nil {
 		conn.Close()
 		return
 	}
 
 	// 创建隧道连接并启动转发
-	tc := NewTunnelConn(msg.ConnID)
+	tc := NewTunnelConn(connID)
 	c.pool.Put(tc)
 
 	c.mu.Lock()
 	codec := c.codec
 	c.mu.Unlock()
 
-	// 全双工数据转发
-	err = CopyData(c.ctx, conn, tc, codec, 32*1024)
+	// 全双工数据转发（bufSize=0 使用默认64KB，由 CopyData 内部缓冲区池提供）
+	err = CopyData(c.ctx, conn, tc, codec, 0)
 
 	conn.Close()
-	c.pool.Remove(msg.ConnID)
+	c.pool.Remove(connID)
 
 	// 发送 CLOSE
 	closeMsg := &protocol.Message{
 		Type:   protocol.TypeClose,
-		ConnID: msg.ConnID,
+		ConnID: connID,
 	}
 	codec.WriteMessage(closeMsg)
 
 	if err != nil && err != c.ctx.Err() {
-		log.Debugf("[Client] Conn %d data forwarding ended: %v", msg.ConnID, err)
+		log.Debugf("[Client] Conn %d data forwarding ended: %v", connID, err)
 	}
 }
 

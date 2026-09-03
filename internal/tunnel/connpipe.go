@@ -44,9 +44,14 @@ func (cp *ConnPipe) Read(buf []byte) (int, error) {
 				return 0, io.EOF
 			}
 			n := copy(buf, data)
-			// 剩余数据暂存到 readBuf
+			// 剩余数据拷贝到 readBuf（避免保持对原始 data 大切片的引用，帮助 GC 回收）
 			if n < len(data) {
-				cp.readBuf = data[n:]
+				if cap(cp.readBuf) >= len(data)-n {
+					cp.readBuf = cp.readBuf[:len(data)-n]
+				} else {
+					cp.readBuf = make([]byte, len(data)-n)
+				}
+				copy(cp.readBuf, data[n:])
 			}
 			return n, nil
 		case <-cp.tc.closeCh:
@@ -108,10 +113,10 @@ func (cp *ConnPipe) SetWriteDeadline(_ time.Time) error {
 }
 
 // TunnelWriter 实现 io.Writer，通过 DATA 报文向隧道写入数据
+// 注意：不需要额外的 mu 锁，因为 Codec.writeFrame 内部已有 encMu 保护写操作
 type TunnelWriter struct {
 	connID uint64
 	codec  *protocol.Codec
-	mu     sync.Mutex
 }
 
 // NewTunnelWriter 创建 TunnelWriter
@@ -124,8 +129,6 @@ func NewTunnelWriter(connID uint64, codec *protocol.Codec) *TunnelWriter {
 
 // Write 实现 io.Writer 接口
 func (tw *TunnelWriter) Write(p []byte) (int, error) {
-	tw.mu.Lock()
-	defer tw.mu.Unlock()
 	if err := tw.codec.WriteData(tw.connID, p); err != nil {
 		return 0, err
 	}
@@ -151,7 +154,7 @@ func (tr *TunnelReader) Read(p []byte) (int, error) {
 // local: 本地目标连接，tc: 隧道连接，codec: 协议编解码器，bufSize: 缓冲区大小
 func CopyData(ctx context.Context, local net.Conn, tc *TunnelConn, codec *protocol.Codec, bufSize int) error {
 	if bufSize <= 0 {
-		bufSize = 32 * 1024
+		bufSize = 64 * 1024 // 默认 64KB（相比原 32KB 翻倍，参考 frp 大缓冲策略）
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -165,7 +168,8 @@ func CopyData(ctx context.Context, local net.Conn, tc *TunnelConn, codec *protoc
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		buf := make([]byte, bufSize)
+		buf := copyBufPoolGet(bufSize)
+		defer copyBufPoolPut(buf)
 		tw := NewTunnelWriter(tc.ConnID, codec)
 		for {
 			select {
@@ -195,7 +199,8 @@ func CopyData(ctx context.Context, local net.Conn, tc *TunnelConn, codec *protoc
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		buf := make([]byte, bufSize)
+		buf := copyBufPoolGet(bufSize)
+		defer copyBufPoolPut(buf)
 		tr := NewTunnelReader(tc)
 		for {
 			select {
@@ -230,4 +235,29 @@ func CopyData(ctx context.Context, local net.Conn, tc *TunnelConn, codec *protoc
 		return dstErr
 	}
 	return nil
+}
+
+// copyBufPool 池化 CopyData 使用的读写缓冲区（64KB），减少 GC 压力
+// 使用 *[]byte 避免 interface{} 装箱开销
+var copyBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 64*1024)
+		return &b
+	},
+}
+
+func copyBufPoolGet(size int) []byte {
+	p := copyBufPool.Get().(*[]byte)
+	buf := *p
+	if cap(buf) >= size {
+		return buf[:size]
+	}
+	// 池中缓冲区太小，分配新的（不放回池中，由调用方自行处理）
+	return make([]byte, size)
+}
+
+func copyBufPoolPut(buf []byte) {
+	if cap(buf) >= 64*1024 {
+		copyBufPool.Put(&buf)
+	}
 }

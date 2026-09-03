@@ -56,8 +56,8 @@
 ### 编译
 
 ```bash
-go build -o ezrps ./cmd/server
-go build -o ezrpc ./cmd/client
+CGO_ENABLED=0 go build -o ezrps ./cmd/server
+CGO_ENABLED=0 go build -o ezrpc ./cmd/client
 ```
 
 ### 生成默认配置
