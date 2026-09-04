@@ -300,23 +300,25 @@ func (s *Server) agentReadLoop(agent *Agent) {
 			msg.Release()
 
 		case protocol.TypeData:
-			// 异步分发：避免单个连接的 SendData 阻塞整个 agent 的消息循环
-			// 每个连接的数据处理在独立 goroutine 中进行
+			// 同步分发：agentReadLoop 按 TCP 收到的顺序依次调用 SendData，
+			// 保证同一 connID 的数据严格有序写入 readCh。
+			// readCh 缓冲区容量 4096，足够承载背压而不会阻塞其他连接。
 			connID := msg.ConnID
 			payload := msg.Payload
-			msg.Release() // Message struct 归还池，payload 由 SendData 消费
+			msg.Release()
 			tc, ok := agent.pool.Get(connID)
 			if ok {
-				go func() {
-					if !tc.SendData(s.ctx, payload) {
-						log.Warnf("[Tunnel] Agent %d conn %d SendData failed, consumer may be slow", agent.ID, connID)
-					}
-				}()
+				if !tc.SendData(s.ctx, payload) {
+					log.Warnf("[Tunnel] Agent %d conn %d SendData failed", agent.ID, connID)
+				}
 			}
 
 		case protocol.TypeClose:
-			agent.pool.Remove(msg.ConnID)
+			// TypeData 已改为同步调用，不存在异步写入竞争，
+			// 直接移除连接即可。
+			connID := msg.ConnID
 			msg.Release()
+			agent.pool.Remove(connID)
 
 		default:
 			log.Warnf("[Tunnel] Agent %d: unknown message type 0x%02x", agent.ID, msg.Type)

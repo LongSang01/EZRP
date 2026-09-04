@@ -293,13 +293,15 @@ func (s *Server) relay(left, right net.Conn, leftAddr, rightAddr string) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	cp := func(dst, src net.Conn) {
+	cp := func(name string, dst, src net.Conn) {
 		defer wg.Done()
 		defer cancel()
 		buf := make([]byte, 64*1024) // 64KB 缓冲区，与 CopyData 保持一致
+		log.Debugf("[SOCKS5] Relay %s start: %s -> %s", name, src.RemoteAddr(), dst.RemoteAddr())
 		for {
 			select {
 			case <-ctx.Done():
+				log.Debugf("[SOCKS5] Relay %s exit: ctx done", name)
 				return
 			default:
 			}
@@ -308,17 +310,20 @@ func (s *Server) relay(left, right net.Conn, leftAddr, rightAddr string) {
 			if n > 0 {
 				dst.SetWriteDeadline(time.Now().Add(60 * time.Second))
 				if _, ew := dst.Write(buf[:n]); ew != nil {
+					log.Debugf("[SOCKS5] Relay %s exit: write error %v", name, ew)
 					return
 				}
+				log.Tracef("[SOCKS5] Relay %s: forwarded %d bytes", name, n)
 			}
 			if err != nil {
+				log.Debugf("[SOCKS5] Relay %s exit: read error %v", name, err)
 				return
 			}
 		}
 	}
 
-	go cp(right, left)
-	go cp(left, right)
+	go cp("browser→tunnel", right, left)
+	go cp("tunnel→browser", left, right)
 
 	wg.Wait()
 	log.Infof("[SOCKS5] Relay closed %s <-> %s", leftAddr, rightAddr)

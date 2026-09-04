@@ -238,22 +238,24 @@ func (c *Client) eventLoop() error {
 			go c.handleConnect(msg)
 
 		case protocol.TypeData:
-			// 异步分发：避免单个连接的 SendData 阻塞整个客户端的消息循环
+			// 同步分发：eventLoop 按 TCP 收到的顺序依次调用 SendData，
+			// 保证同一 connID 的数据严格有序写入 readCh。
 			connID := msg.ConnID
 			payload := msg.Payload
 			msg.Release()
 			tc, ok := c.pool.Get(connID)
 			if ok {
-				go func() {
-					if !tc.SendData(c.ctx, payload) {
-						log.Warnf("[Client] conn %d SendData failed, consumer may be slow", connID)
-					}
-				}()
+				if !tc.SendData(c.ctx, payload) {
+					log.Warnf("[Client] conn %d SendData failed", connID)
+				}
 			}
 
 		case protocol.TypeClose:
-			c.pool.Remove(msg.ConnID)
+			// TypeData 已改为同步调用，不存在异步写入竞争，
+			// 直接移除连接即可。
+			connID := msg.ConnID
 			msg.Release()
+			c.pool.Remove(connID)
 
 		default:
 			log.Warnf("[Client] Unknown message type: 0x%02x", msg.Type)

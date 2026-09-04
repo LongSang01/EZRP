@@ -51,8 +51,7 @@ func NewTunnelConn(connID uint64) *TunnelConn {
 }
 
 // SendData 向此隧道连接发送数据（写入 readCh 缓冲区）
-// 使用完全阻塞写入实现背压：当消费端读取慢时，发送端会阻塞等待，
-// 由异步 goroutine 承载等待开销，绝不会丢弃数据。
+// 使用完全阻塞写入实现背压：当消费端读取慢时，发送端会阻塞等待。
 // 返回 false 表示连接已关闭或上下文取消。
 func (tc *TunnelConn) SendData(ctx context.Context, data []byte) bool {
 	tc.mu.Lock()
@@ -69,7 +68,6 @@ func (tc *TunnelConn) SendData(ctx context.Context, data []byte) bool {
 	}
 
 	// 缓冲区满——完全阻塞等待空间释放，绝不丢数据
-	// 异步 goroutine 会承载此阻塞，不影响 agentReadLoop 处理其他连接
 	// 连接关闭时通过 closeCh 解除阻塞
 	select {
 	case tc.readCh <- data:
@@ -82,7 +80,20 @@ func (tc *TunnelConn) SendData(ctx context.Context, data []byte) bool {
 }
 
 // ReadData 从隧道连接读取数据（阻塞直到有数据可用或连接关闭）
+// 当 closeCh 关闭后，优先排空 readCh 中的剩余数据再返回 EOF
 func (tc *TunnelConn) ReadData(buf []byte) (int, error) {
+	// 优先尝试非阻塞读取（正常路径，缓冲区有数据时零开销）
+	select {
+	case data, ok := <-tc.readCh:
+		if !ok {
+			return 0, fmt.Errorf("connection closed")
+		}
+		n := copy(buf, data)
+		return n, nil
+	default:
+	}
+
+	// 无数据可读，等待数据、关闭或取消
 	select {
 	case data, ok := <-tc.readCh:
 		if !ok {
@@ -91,25 +102,29 @@ func (tc *TunnelConn) ReadData(buf []byte) (int, error) {
 		n := copy(buf, data)
 		return n, nil
 	case <-tc.closeCh:
-		return 0, fmt.Errorf("connection closed")
+		// 连接已关闭，但 readCh 中可能还有未读数据，继续排空
+		select {
+		case data, ok := <-tc.readCh:
+			if !ok {
+				return 0, fmt.Errorf("connection closed")
+			}
+			n := copy(buf, data)
+			return n, nil
+		default:
+			return 0, fmt.Errorf("connection closed")
+		}
 	case <-tc.ctx.Done():
 		return 0, tc.ctx.Err()
 	}
 }
 
-// Close 关闭此隧道连接，释放所有资源
+// Close 关闭此隧道连接，释放所有资源。
+// 不排空 readCh——残留数据由消费端（ConnPipe.Read / ReadData）在
+// 检测到 closeCh 后自行排空，避免数据丢失。
 func (tc *TunnelConn) Close() {
 	if tc.closed.CompareAndSwap(false, true) {
 		tc.cancel()
 		close(tc.closeCh)
-		// 排空 readCh 中残留的数据
-		for {
-			select {
-			case <-tc.readCh:
-			default:
-				return
-			}
-		}
 	}
 }
 
@@ -119,6 +134,13 @@ func (cp *ConnPool) Get(connID uint64) (*TunnelConn, bool) {
 	defer cp.mu.RUnlock()
 	tc, ok := cp.conns[connID]
 	return tc, ok
+}
+
+// Count 返回连接池中的连接数
+func (cp *ConnPool) Count() int {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	return len(cp.conns)
 }
 
 // Put 向连接池添加一条隧道连接
@@ -140,7 +162,6 @@ func (cp *ConnPool) Remove(connID uint64) {
 		delete(cp.conns, connID)
 	}
 	cp.mu.Unlock()
-
 	if ok {
 		tc.Close()
 	}
@@ -149,19 +170,10 @@ func (cp *ConnPool) Remove(connID uint64) {
 // Close 关闭连接池中的所有连接
 func (cp *ConnPool) Close() {
 	cp.mu.Lock()
+	defer cp.mu.Unlock()
 	cp.closed = true
-	conns := cp.conns
-	cp.conns = make(map[uint64]*TunnelConn)
-	cp.mu.Unlock()
-
-	for _, tc := range conns {
+	for _, tc := range cp.conns {
 		tc.Close()
 	}
-}
-
-// Count 返回活动连接数量
-func (cp *ConnPool) Count() int {
-	cp.mu.RLock()
-	defer cp.mu.RUnlock()
-	return len(cp.conns)
+	cp.conns = nil
 }

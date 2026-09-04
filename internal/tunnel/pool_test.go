@@ -1,12 +1,15 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"EZRP/internal/protocol"
 )
 
 // ============================================================
@@ -513,5 +516,130 @@ func TestTunnelConn_ReadData_CloseUnblocksReader(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ReadData did not unblock after Close")
+	}
+}
+
+// ============================================================
+// 关键回归测试：Close() 不丢弃 readCh 中未读数据
+// 这是图片加载截断 bug 的直接回归测试
+// ============================================================
+
+// TestTunnelConn_DataPreservedAfterClose 验证 Close() 不会丢弃 readCh 中的数据。
+// 场景：异步 goroutine 发送数据到 readCh，然后 Close() 被调用。
+// 消费端应能读取到所有数据后才看到 EOF。
+func TestTunnelConn_DataPreservedAfterClose(t *testing.T) {
+	tc := NewTunnelConn(1)
+	msgCount := 100
+
+	// 模拟服务端异步分发：多个 goroutine 发送数据
+	var wg sync.WaitGroup
+	for i := 0; i < msgCount; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			data := []byte(fmt.Sprintf("data-%04d", idx))
+			tc.SendData(context.Background(), data)
+		}(i)
+	}
+
+	// 等待所有发送 goroutine 完成（模拟 pendingWrites）
+	wg.Wait()
+
+	// Close 不再排空 readCh
+	tc.Close()
+
+	// 消费端应能读取所有数据
+	received := 0
+	buf := make([]byte, 128)
+	for {
+		n, err := tc.ReadData(buf)
+		if err != nil {
+			break // EOF 或 connection closed
+		}
+		received++
+		_ = string(buf[:n])
+	}
+
+	if received != msgCount {
+		t.Fatalf("expected %d messages after Close, got %d (DATA LOSS!)", msgCount, received)
+	}
+}
+
+// TestConnPipe_DataDrainedAfterClose 验证 ConnPipe.Read 在 closeCh 关闭后
+// 仍能排空 readCh 中的剩余数据。模拟真实场景：服务端收到 TypeClose 时
+// readCh 中还有未读数据。
+func TestConnPipe_DataDrainedAfterClose(t *testing.T) {
+	tc := NewTunnelConn(1)
+	// 创建真实 codec（测试只使用 Read 路径，Write 路径不影响）
+	codec := protocol.NewCodec(&bytes.Buffer{})
+	cp := NewConnPipe(tc, codec)
+
+	msgCount := 200
+
+	// 先把数据全部放入 readCh
+	for i := 0; i < msgCount; i++ {
+		data := []byte(fmt.Sprintf("chunk-%04d", i))
+		tc.SendData(context.Background(), data)
+	}
+
+	// 关闭连接（模拟 TypeClose 到达）
+	tc.Close()
+
+	// ConnPipe 应能读取所有数据
+	received := 0
+	buf := make([]byte, 128)
+	for {
+		n, err := cp.Read(buf)
+		if err != nil {
+			break
+		}
+		received++
+		_ = string(buf[:n])
+	}
+
+	if received != msgCount {
+		t.Fatalf("expected %d messages, got %d (DATA LOSS!)", msgCount, received)
+	}
+}
+
+// TestConnPipe_DataDeliveredWithAsyncClose 模拟最接近真实 bug 的场景：
+// 异步 goroutine 发送数据的同时 Close() 被调用，验证数据不丢失。
+func TestConnPipe_DataDeliveredWithAsyncClose(t *testing.T) {
+	tc := NewTunnelConn(1)
+	codec := protocol.NewCodec(&bytes.Buffer{})
+	cp := NewConnPipe(tc, codec)
+
+	msgCount := 500
+	sent := make(chan struct{})
+
+	// 模拟异步 TypeData goroutine
+	go func() {
+		for i := 0; i < msgCount; i++ {
+			data := []byte(fmt.Sprintf("async-%04d", i))
+			tc.SendData(context.Background(), data)
+		}
+		close(sent)
+	}()
+
+	// 等待所有数据发送完成（模拟 pendingWrites.Wait()）
+	<-sent
+
+	// 模拟 TypeClose 到达
+	tc.Close()
+
+	// 读取所有数据
+	received := 0
+	buf := make([]byte, 128)
+	for {
+		n, err := cp.Read(buf)
+		if err != nil {
+			break
+		}
+		received++
+		_ = string(buf[:n])
+	}
+
+	if received != msgCount {
+		t.Fatalf("expected %d messages, got %d (DATA LOSS with async close!)", msgCount, received)
 	}
 }

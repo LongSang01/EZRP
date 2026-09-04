@@ -30,6 +30,7 @@ func NewConnPipe(tc *TunnelConn, codec *protocol.Codec) *ConnPipe {
 }
 
 // Read 从隧道读取数据（来自远端发送方/Agent）
+// 当 closeCh 关闭后（连接已关闭），优先排空 readCh 中的剩余数据再返回 EOF
 func (cp *ConnPipe) Read(buf []byte) (int, error) {
 	// 暂存未读完的数据行先读出
 	if len(cp.readBuf) > 0 {
@@ -37,25 +38,55 @@ func (cp *ConnPipe) Read(buf []byte) (int, error) {
 		cp.readBuf = cp.readBuf[n:]
 		return n, nil
 	}
+
+	// storeRemainder 将 data 中超出 buf 的部分暂存到 readBuf
+	storeRemainder := func(data []byte, n int) {
+		if n < len(data) {
+			if cap(cp.readBuf) >= len(data)-n {
+				cp.readBuf = cp.readBuf[:len(data)-n]
+			} else {
+				cp.readBuf = make([]byte, len(data)-n)
+			}
+			copy(cp.readBuf, data[n:])
+		}
+	}
+
 	for {
+		// 优先尝试非阻塞读取，确保不会因 closeCh 随机选中而丢失数据
 		select {
 		case data, ok := <-cp.tc.readCh:
 			if !ok {
 				return 0, io.EOF
 			}
 			n := copy(buf, data)
-			// 剩余数据拷贝到 readBuf（避免保持对原始 data 大切片的引用，帮助 GC 回收）
-			if n < len(data) {
-				if cap(cp.readBuf) >= len(data)-n {
-					cp.readBuf = cp.readBuf[:len(data)-n]
-				} else {
-					cp.readBuf = make([]byte, len(data)-n)
-				}
-				copy(cp.readBuf, data[n:])
+			storeRemainder(data, n)
+			return n, nil
+		default:
+		}
+
+		// 无数据可读，等待新数据、关闭信号或取消
+		select {
+		case data, ok := <-cp.tc.readCh:
+			if !ok {
+				return 0, io.EOF
 			}
+			n := copy(buf, data)
+			storeRemainder(data, n)
 			return n, nil
 		case <-cp.tc.closeCh:
-			return 0, io.EOF
+			// 连接已关闭，但 readCh 中可能还有未读完的数据（来自异步 SendData goroutine），
+			// 继续排空 readCh 直到为空才返回 EOF
+			select {
+			case data, ok := <-cp.tc.readCh:
+				if !ok {
+					return 0, io.EOF
+				}
+				n := copy(buf, data)
+				storeRemainder(data, n)
+				return n, nil
+			default:
+				return 0, io.EOF
+			}
 		case <-cp.tc.ctx.Done():
 			return 0, cp.tc.ctx.Err()
 		}
